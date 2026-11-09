@@ -1,0 +1,673 @@
+#!/usr/bin/env python3
+"""cec-assist: keep a TV remote working with SteamOS's HDMI-CEC daemon (cecd).
+
+Subcommands:
+  daemon   Background fixer: claims CEC "active source" when the TV switches to
+           this device's input (incl. through HDMI switches/AVRs that don't
+           forward CEC routing) and, optionally, when the Steam Controller is used.
+  claim    Claim active source now (restarts cecd first if it isn't running).
+  monitor  Show CEC routing messages and remote button presses live.
+  remap    Remap remote buttons to other keys, keeping cecd's full default table.
+  status   Show cecd / daemon / mapping state.
+
+Only uses the Python standard library plus gdbus/busctl/dbus-monitor/systemctl,
+which ship with SteamOS. Talks to cecd over the session D-Bus; never needs root.
+"""
+import argparse
+import configparser
+import os
+import re
+import select
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "0.1.0"
+
+# --------------------------------------------------------------------------
+# cecd D-Bus plumbing
+# --------------------------------------------------------------------------
+DEST = "com.steampowered.CecDaemon1"
+DEV_IFACE = "com.steampowered.CecDaemon1.CecDevice1"
+CFG_IFACE = "com.steampowered.CecDaemon1.Config1"
+DAEMON_OBJ = "/com/steampowered/CecDaemon1/Daemon"
+DEFAULT_DEV_OBJ = "/com/steampowered/CecDaemon1/Devices/Cec0"
+
+CECD_CONFIG_DIR = os.path.expanduser("~/.config/cecd/config.d")
+MAPPING_FILE = os.path.join(CECD_CONFIG_DIR, "50-cec-assist-mappings.toml")
+CONFIG_FILE = os.path.expanduser("~/.config/cec-assist/config.ini")
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def run(cmd, timeout=10):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def device_obj():
+    """Object path of the first CEC device cecd exposes."""
+    try:
+        out = run(["busctl", "--user", "tree", "--list", DEST]).stdout
+        devs = [l.strip() for l in out.splitlines() if "/Devices/" in l]
+        if devs:
+            return sorted(devs)[0]
+    except Exception:
+        pass
+    return DEFAULT_DEV_OBJ
+
+
+def get_prop(obj, iface, prop):
+    r = run(["busctl", "--user", "get-property", DEST, obj, iface, prop])
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def own_phys_addr(obj):
+    out = get_prop(obj, DEV_IFACE, "PhysicalAddress")  # e.g. "q 8704"
+    try:
+        return int(out.split()[-1])
+    except Exception:
+        return None
+
+
+def set_active_source(obj):
+    r = run(["gdbus", "call", "--session", "-d", DEST, "-o", obj, "-m",
+             f"{DEV_IFACE}.SetActiveSource", "--", "-1"])
+    return r.returncode == 0, r.stderr.strip()
+
+
+def cecd_active():
+    return run(["systemctl", "--user", "is-active", "--quiet", "cecd"]).returncode == 0
+
+
+def restart_cecd():
+    run(["systemctl", "--user", "reset-failed", "cecd"])
+    return run(["systemctl", "--user", "restart", "cecd"], timeout=30).returncode == 0
+
+
+# --------------------------------------------------------------------------
+# CEC helpers
+# --------------------------------------------------------------------------
+OP_ROUTING_CHANGE = 0x80
+OP_ROUTING_INFO = 0x81
+OP_ACTIVE_SOURCE = 0x82
+OP_REPORT_PHYS_ADDR = 0x84
+OP_REQUEST_ACTIVE_SOURCE = 0x85
+OP_SET_STREAM_PATH = 0x86
+OP_INACTIVE_SOURCE = 0x9D
+OP_STANDBY = 0x36
+OP_IMAGE_VIEW_ON = 0x04
+OP_TEXT_VIEW_ON = 0x0D
+OP_USER_CONTROL_PRESSED = 0x44
+
+ROUTING_OPS = {
+    OP_ROUTING_CHANGE: "Routing Change", OP_ROUTING_INFO: "Routing Information",
+    OP_ACTIVE_SOURCE: "Active Source", OP_REQUEST_ACTIVE_SOURCE: "Request Active Source",
+    OP_SET_STREAM_PATH: "Set Stream Path", OP_INACTIVE_SOURCE: "Inactive Source",
+    OP_STANDBY: "Standby", OP_IMAGE_VIEW_ON: "Image View On", OP_TEXT_VIEW_ON: "Text View On",
+    OP_REPORT_PHYS_ADDR: "Report Physical Address",
+}
+LOGICAL_NAMES = ["TV", "Recording 1", "Recording 2", "Tuner 1", "Playback 1", "Audio System",
+                 "Tuner 2", "Tuner 3", "Playback 2", "Recording 3", "Tuner 4", "Playback 3",
+                 "Backup 1", "Backup 2", "Specific", "Broadcast"]
+
+
+def nibbles(pa):
+    return [(pa >> s) & 0xF for s in (12, 8, 4, 0)]
+
+
+def fmt_pa(pa):
+    return "?" if pa is None else ".".join(str(n) for n in nibbles(pa))
+
+
+def pa_from(b, i=0):
+    return (b[i] << 8) | b[i + 1] if len(b) >= i + 2 else None
+
+
+def on_our_branch(route, ours):
+    """True if `route` is our physical address or an ancestor of it."""
+    if ours is None or ours == 0xFFFF or route in (None, 0, 0xFFFF):
+        return False
+    r, o = nibbles(route), nibbles(ours)
+    depth = 0
+    while depth < 4 and r[depth] != 0:
+        depth += 1
+    return r[:depth] == o[:depth] and all(n == 0 for n in r[depth:])
+
+
+def dbus_cec_messages(member="ReceivedMessage"):
+    """Yield (initiator, message bytes) from cecd's D-Bus signal."""
+    p = subprocess.Popen(
+        ["dbus-monitor", "--session",
+         f"type='signal',interface='{DEV_IFACE}',member='{member}'"],
+        stdout=subprocess.PIPE, text=True)
+    buf = []
+
+    def parse(block):
+        if f"member={member}" not in block:
+            return None
+        v = re.findall(r"^\s*byte (\d+)", block, re.M)
+        arr = re.search(r"array of bytes \[\s*(.*?)\s*\]", block, re.S)
+        s = re.search(r'array of bytes "(.*?)"', block)
+        if arr:
+            msg = [int(x, 16) for x in arr.group(1).split()]
+        elif s:  # dbus-monitor prints NUL-terminated byte arrays as strings
+            msg = [ord(c) for c in s.group(1)] + [0]
+        else:
+            return None
+        if not v:
+            return None
+        return int(v[0]), msg
+
+    try:
+        for line in p.stdout:
+            if line.startswith("signal ") and buf:
+                buf = []
+            buf.append(line.rstrip("\n"))
+            st = line.strip()
+            if st == "]" or st.startswith('array of bytes "'):
+                res = parse("\n".join(buf))
+                buf = []
+                if res:
+                    yield res
+    finally:
+        p.terminate()
+    raise RuntimeError(f"dbus-monitor exited ({p.wait()})")
+
+
+# --------------------------------------------------------------------------
+# Remote button names / key codes
+# --------------------------------------------------------------------------
+# cecd's names for CEC UI commands (kebab-case), as accepted in [mappings].
+UI_NAMES = {
+    0x00: "select", 0x01: "up", 0x02: "down", 0x03: "left", 0x04: "right",
+    0x05: "right-up", 0x06: "right-down", 0x07: "left-up", 0x08: "left-down",
+    0x09: "device-root-menu", 0x0A: "device-setup-menu", 0x0B: "contents-menu",
+    0x0C: "favorite-menu", 0x0D: "exit", 0x10: "media-top-menu",
+    0x11: "media-context-sensitive-menu", 0x1D: "number-entry-mode", 0x1E: "11", 0x1F: "12",
+    0x20: "10", **{0x20 + i: str(i) for i in range(1, 10)},
+    0x2A: "dot", 0x2B: "enter", 0x2C: "clear", 0x2F: "next-favorite", 0x30: "channel-up",
+    0x31: "channel-down", 0x32: "previous-channel", 0x33: "sound-select", 0x34: "input-select",
+    0x35: "display-information", 0x36: "help", 0x37: "page-up", 0x38: "page-down",
+    0x40: "power", 0x41: "volume-up", 0x42: "volume-down", 0x43: "mute", 0x44: "play",
+    0x45: "stop", 0x46: "pause", 0x47: "record", 0x48: "rewind", 0x49: "fast-forward",
+    0x4A: "eject", 0x4B: "skip-forward", 0x4C: "skip-backward", 0x4D: "stop-record",
+    0x4E: "pause-record", 0x50: "angle", 0x51: "sub-picture", 0x52: "video-on-demand",
+    0x53: "electronic-program-guide", 0x54: "timer-programming",
+    0x55: "initial-configuration", 0x56: "select-broadcast-type",
+    0x57: "select-sound-presentation", 0x58: "audio-description", 0x59: "internet",
+    0x5A: "3d-mode", 0x60: "play-function", 0x61: "pause-play-function",
+    0x62: "record-function", 0x63: "pause-record-function", 0x64: "stop-function",
+    0x65: "mute-function", 0x66: "restore-volume-function", 0x67: "tune-function",
+    0x68: "select-media-function", 0x69: "select-av-input-function",
+    0x6A: "select-audio-input-function", 0x6B: "power-toggle-function",
+    0x6C: "power-off-function", 0x6D: "power-on-function", 0x71: "blue", 0x72: "red",
+    0x73: "green", 0x74: "yellow", 0x75: "f5", 0x76: "data",
+}
+UI_CODES = {v: k for k, v in UI_NAMES.items()}
+
+# cecd 0.3.0's built-in table (CEC UI command -> Linux keycode), captured from
+# the Mappings D-Bus property with no [mappings] override present.
+STOCK_MAPPINGS = {
+    0x1d: 413, 0x75: 63, 0x02: 108, 0x35: 358, 0x72: 398, 0x4d: 625, 0x07: 616, 0x41: 115,
+    0x36: 138, 0x71: 401, 0x54: 359, 0x00: 28, 0x37: 104, 0x38: 109, 0x42: 114, 0x74: 400,
+    0x0c: 364, 0x66: 628, 0x03: 105, 0x01: 103, 0x0b: 139, 0x2c: 355, 0x46: 201, 0x05: 614,
+    0x50: 371, 0x09: 618, 0x53: 365, 0x59: 150, 0x2f: 624, 0x29: 10, 0x6d: 143, 0x1e: 620,
+    0x76: 631, 0x32: 412, 0x55: 171, 0x44: 200, 0x04: 106, 0x08: 617, 0x28: 9, 0x11: 438,
+    0x40: 116, 0x5a: 623, 0x43: 113, 0x73: 399, 0x21: 2, 0x0a: 141, 0x52: 627, 0x0d: 1,
+    0x27: 8, 0x06: 615, 0x4e: 626, 0x25: 6, 0x58: 622, 0x30: 402, 0x45: 166, 0x22: 3,
+    0x10: 619, 0x24: 5, 0x20: 11, 0x2b: 28, 0x2a: 52, 0x6c: 142, 0x48: 168, 0x33: 213,
+    0x1f: 621, 0x49: 208, 0x26: 7, 0x31: 403, 0x47: 167, 0x4a: 161, 0x6b: 116, 0x4c: 165,
+    0x23: 4, 0x4b: 163,
+}
+
+# Common Linux input key codes (linux/input-event-codes.h). Integers also accepted.
+KEY_CODES = {
+    "KEY_RESERVED": 0, "KEY_ESC": 1, "KEY_ENTER": 28, "KEY_SPACE": 57, "KEY_HOME": 102,
+    "KEY_UP": 103, "KEY_PAGEUP": 104, "KEY_LEFT": 105, "KEY_RIGHT": 106, "KEY_DOWN": 108,
+    "KEY_PAGEDOWN": 109, "KEY_MUTE": 113, "KEY_VOLUMEDOWN": 114, "KEY_VOLUMEUP": 115,
+    "KEY_POWER": 116, "KEY_PAUSE": 119, "KEY_STOP": 128, "KEY_MENU": 139, "KEY_BACK": 158,
+    "KEY_NEXTSONG": 163, "KEY_PLAYPAUSE": 164, "KEY_PREVIOUSSONG": 165, "KEY_STOPCD": 166,
+    "KEY_RECORD": 167, "KEY_REWIND": 168, "KEY_HOMEPAGE": 172, "KEY_EXIT": 174,
+    "KEY_PLAYCD": 200, "KEY_PAUSECD": 201, "KEY_PLAY": 207, "KEY_FASTFORWARD": 208,
+    "KEY_SELECT": 353, "KEY_OK": 352, "KEY_INFO": 358, "KEY_SUBTITLE": 370,
+    "KEY_CHANNELUP": 402, "KEY_CHANNELDOWN": 403, "KEY_RED": 398, "KEY_GREEN": 399,
+    "KEY_YELLOW": 400, "KEY_BLUE": 401,
+}
+KEY_NAMES = {}
+for _n, _c in KEY_CODES.items():
+    KEY_NAMES.setdefault(_c, _n)
+
+
+def key_label(code):
+    return KEY_NAMES.get(code, str(code))
+
+
+# --------------------------------------------------------------------------
+# daemon
+# --------------------------------------------------------------------------
+DEFAULTS = {
+    "settle_seconds": "1.0",
+    "controller_trigger": "true",
+    "controller_cooldown_seconds": "30",
+    "controller_names": "Steam Controller, X-Box 360 pad, Steam Deck",
+    "log_routing": "true",
+}
+
+
+def load_config():
+    cp = configparser.ConfigParser()
+    cp["daemon"] = DEFAULTS
+    cp.read(CONFIG_FILE)
+    return cp["daemon"]
+
+
+class Daemon:
+    EV_KEY, EV_ABS = 0x01, 0x03
+    ABS_HAT0X, ABS_HAT0Y = 0x10, 0x11
+    EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit
+
+    def __init__(self, cfg):
+        self.settle = cfg.getfloat("settle_seconds")
+        self.controller_trigger = cfg.getboolean("controller_trigger")
+        self.cooldown = cfg.getfloat("controller_cooldown_seconds")
+        self.controller_names = [n.strip() for n in cfg["controller_names"].split(",") if n.strip()]
+        self.log_routing = cfg.getboolean("log_routing")
+        self.obj = device_obj()
+        self.timer = None
+        self.lock = threading.Lock()
+        self.current_route = None
+
+    # -- claiming ---------------------------------------------------------
+    def claim_now(self, reason):
+        with self.lock:
+            self.timer = None
+        ok, err = set_active_source(self.obj)
+        log(f"claimed active source ({reason})" if ok else f"SetActiveSource failed ({reason}): {err}")
+
+    def claim_later(self, reason):
+        """Trailing debounce: the TV sends Routing Change and Set Stream Path in
+        quick succession (either order); answer only after the burst ends."""
+        with self.lock:
+            if self.timer is not None:
+                self.timer.cancel()
+            self.timer = threading.Timer(self.settle, self.claim_now, args=(reason,))
+            self.timer.daemon = True
+            self.timer.start()
+
+    def cancel(self, reason):
+        with self.lock:
+            if self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
+                log(f"pending claim cancelled ({reason})")
+
+    # -- CEC routing ------------------------------------------------------
+    def handle(self, src, msg):
+        if not msg:
+            return
+        op, args = msg[0], msg[1:]
+        if op not in ROUTING_OPS:
+            return
+        if self.log_routing:
+            log(f"rx {LOGICAL_NAMES[src & 15]}: {ROUTING_OPS[op]} " + " ".join(f"{b:02x}" for b in msg))
+        ours = own_phys_addr(self.obj)
+        if op == OP_ACTIVE_SOURCE:
+            self.current_route = pa_from(args)
+            if src != 0 and not on_our_branch(self.current_route, ours):
+                self.cancel(f"{LOGICAL_NAMES[src & 15]} became active source at {fmt_pa(self.current_route)}")
+            return
+        if op == OP_REQUEST_ACTIVE_SOURCE:
+            if on_our_branch(self.current_route, ours):
+                self.claim_later("TV asked for active source while on our input")
+            return
+        if op == OP_SET_STREAM_PATH:
+            route = pa_from(args)
+        elif op == OP_ROUTING_CHANGE:
+            route = pa_from(args, 2)
+        else:
+            return
+        self.current_route = route
+        if src != 0:
+            return
+        if on_our_branch(route, ours):
+            self.claim_later(f"TV routed to {fmt_pa(route)}, we are {fmt_pa(ours)}")
+        else:
+            self.cancel(f"TV routed to {fmt_pa(route)}")
+
+    # -- controller trigger -----------------------------------------------
+    def controller_devices(self):
+        found = {}
+        try:
+            blocks = open("/proc/bus/input/devices").read().split("\n\n")
+        except OSError:
+            return found
+        for b in blocks:
+            name = re.search(r'^N: Name="(.*)"', b, re.M)
+            ev = re.search(r"\b(event\d+)\b", b)
+            if name and ev and any(n in name.group(1) for n in self.controller_names):
+                found[f"/dev/input/{ev.group(1)}"] = name.group(1)
+        return found
+
+    def watch_controller(self):
+        fds, last_scan, last_claim = {}, 0.0, 0.0
+        while True:
+            now = time.monotonic()
+            if now - last_scan > 10:  # pick up reconnects / new virtual pads
+                last_scan = now
+                wanted = self.controller_devices()
+                for fd, path in list(fds.items()):
+                    if path not in wanted:
+                        os.close(fd)
+                        del fds[fd]
+                have = set(fds.values())
+                for path in wanted:
+                    if path not in have:
+                        try:  # read-only, never grabbed: other apps still get input
+                            fds[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = path
+                        except OSError:
+                            pass
+            if not fds:
+                time.sleep(5)
+                continue
+            ready, _, _ = select.select(list(fds), [], [], 5)
+            pressed = False
+            for fd in ready:
+                try:
+                    data = os.read(fd, self.EVENT.size * 64)
+                except OSError:
+                    os.close(fd)
+                    del fds[fd]
+                    continue
+                for i in range(0, len(data) - self.EVENT.size + 1, self.EVENT.size):
+                    _, _, etype, code, value = self.EVENT.unpack_from(data, i)
+                    if (etype == self.EV_KEY and value == 1) or (
+                            etype == self.EV_ABS and code in (self.ABS_HAT0X, self.ABS_HAT0Y) and value != 0):
+                        pressed = True
+            if pressed and time.monotonic() - last_claim > self.cooldown:
+                last_claim = time.monotonic()
+                self.claim_now("controller used")
+
+    def run(self):
+        log(f"cec-assist {VERSION} daemon started (device {self.obj}, "
+            f"controller trigger {'on' if self.controller_trigger else 'off'})")
+        if self.controller_trigger:
+            def guarded():
+                while True:
+                    try:
+                        self.watch_controller()
+                    except Exception as e:
+                        log(f"controller watcher error, restarting: {e!r}")
+                        time.sleep(5)
+            threading.Thread(target=guarded, daemon=True).start()
+        for src, msg in dbus_cec_messages():
+            try:
+                self.handle(src, msg)
+            except Exception as e:  # never die on one odd message
+                log(f"error handling {msg}: {e!r}")
+
+
+def cmd_daemon(_args):
+    Daemon(load_config()).run()
+
+
+# --------------------------------------------------------------------------
+# claim
+# --------------------------------------------------------------------------
+def cmd_claim(_args):
+    if not cecd_active():
+        print("cecd is not running, restarting it...")
+        restart_cecd()
+    for _ in range(10):  # cecd needs a moment to (re)open the CEC device
+        if cecd_active():
+            ok, _err = set_active_source(device_obj())
+            if ok:
+                print("This device is now the CEC active source.")
+                return 0
+        time.sleep(1)
+    print("Failed to claim CEC active source. Recent cecd log:", file=sys.stderr)
+    print(run(["journalctl", "--user", "-u", "cecd", "-n", "8", "--no-pager", "-o", "cat"]).stdout,
+          file=sys.stderr)
+    return 1
+
+
+# --------------------------------------------------------------------------
+# monitor
+# --------------------------------------------------------------------------
+def cmd_monitor(args):
+    obj = device_obj()
+    print(f"Our physical address: {fmt_pa(own_phys_addr(obj))}. "
+          "Showing routing messages and remote presses (Ctrl+C to stop).", flush=True)
+    deadline = time.monotonic() + args.seconds if args.seconds else None
+
+    def stop_after():
+        time.sleep(args.seconds)
+        os._exit(0)
+    if deadline:
+        threading.Thread(target=stop_after, daemon=True).start()
+    try:
+        for src, msg in dbus_cec_messages():
+            op, a = msg[0], msg[1:]
+            who = LOGICAL_NAMES[src & 15]
+            ts = time.strftime("%H:%M:%S")
+            if op == OP_USER_CONTROL_PRESSED and a:
+                print(f"{ts}  {who}: button {UI_NAMES.get(a[0], hex(a[0]))} (0x{a[0]:02x})", flush=True)
+            elif op in ROUTING_OPS and (args.all or op not in (OP_REPORT_PHYS_ADDR,)):
+                extra = ""
+                if op in (OP_ACTIVE_SOURCE, OP_SET_STREAM_PATH, OP_ROUTING_INFO,
+                          OP_INACTIVE_SOURCE, OP_REPORT_PHYS_ADDR):
+                    extra = fmt_pa(pa_from(a))
+                elif op == OP_ROUTING_CHANGE:
+                    extra = f"{fmt_pa(pa_from(a))} -> {fmt_pa(pa_from(a, 2))}"
+                print(f"{ts}  {who}: {ROUTING_OPS[op]} {extra}", flush=True)
+            elif args.all:
+                print(f"{ts}  {who}: " + " ".join(f"{b:02x}" for b in msg), flush=True)
+    except KeyboardInterrupt:
+        return 0
+
+
+# --------------------------------------------------------------------------
+# remap
+# --------------------------------------------------------------------------
+def parse_override(spec):
+    if "=" not in spec:
+        raise ValueError(f"expected BUTTON=KEY, got {spec!r}")
+    btn, key = (s.strip() for s in spec.split("=", 1))
+    b = btn.lower()
+    if b.startswith("0x"):
+        code = int(b, 16)
+    elif b in UI_CODES:
+        code = UI_CODES[b]
+    else:
+        raise ValueError(f"unknown button {btn!r} (see: cec-assist remap --list-buttons)")
+    k = key.upper()
+    if not k.startswith("KEY_") and not k.isdigit():
+        k = "KEY_" + k
+    if k.isdigit():
+        val = int(k)
+    elif k in KEY_CODES:
+        val = KEY_CODES[k]
+    else:
+        raise ValueError(f"unknown key {key!r}: use a KEY_* name from --list-keys or a number")
+    return code, val
+
+
+def read_overrides():
+    """Overrides currently in our mapping file (marked with '# override')."""
+    out = {}
+    try:
+        for line in open(MAPPING_FILE):
+            m = re.match(r'\s*"?([a-z0-9-]+)"?\s*=\s*(\d+)\s*#.*override', line)
+            if m and m.group(1) in UI_CODES:
+                out[UI_CODES[m.group(1)]] = int(m.group(2))
+    except OSError:
+        pass
+    return out
+
+
+def write_mapping_file(overrides):
+    lines = [
+        "# Written by cec-assist: cecd's full default button table plus overrides.",
+        "# A [mappings] table REPLACES cecd's defaults, so every button is listed.",
+        "# Change with `cec-assist remap`; remove with `cec-assist remap --reset`.",
+        "[mappings]",
+    ]
+    for code in sorted(STOCK_MAPPINGS):
+        name = UI_NAMES[code]
+        key = name if name[0].isalpha() else f'"{name}"'
+        if code in overrides:
+            lines.append(f"{key} = {overrides[code]}  # 0x{code:02x} override "
+                         f"(default {key_label(STOCK_MAPPINGS[code])}) -> {key_label(overrides[code])}")
+        else:
+            lines.append(f"{key} = {STOCK_MAPPINGS[code]}  # 0x{code:02x} {key_label(STOCK_MAPPINGS[code])}")
+    for code in sorted(set(overrides) - set(STOCK_MAPPINGS)):
+        name = UI_NAMES[code]
+        key = name if name[0].isalpha() else f'"{name}"'
+        lines.append(f"{key} = {overrides[code]}  # 0x{code:02x} override (no default) -> "
+                     f"{key_label(overrides[code])}")
+    os.makedirs(CECD_CONFIG_DIR, exist_ok=True)
+    tmp = MAPPING_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, MAPPING_FILE)
+
+
+def foreign_mapping_files():
+    """Other cecd config files that also define [mappings]."""
+    if not os.path.isdir(CECD_CONFIG_DIR):
+        return []
+    out = []
+    for f in sorted(os.listdir(CECD_CONFIG_DIR)):
+        p = os.path.join(CECD_CONFIG_DIR, f)
+        if f.endswith(".toml") and p != MAPPING_FILE:
+            try:
+                if re.search(r"^\s*\[mappings\]", open(p).read(), re.M):
+                    out.append(f)
+            except OSError:
+                pass
+    return out
+
+
+def apply_with_rollback(change):
+    """Run change(), restart cecd; on failure restore the previous file."""
+    backup = None
+    if os.path.exists(MAPPING_FILE):
+        backup = open(MAPPING_FILE).read()
+    change()
+    restart_cecd()
+    time.sleep(2)
+    if cecd_active():
+        set_active_source(device_obj())  # restarting cecd drops active source
+        return True
+    err = run(["journalctl", "--user", "-u", "cecd", "-n", "5", "--no-pager", "-o", "cat"]).stdout
+    if backup is None:
+        os.remove(MAPPING_FILE)
+    else:
+        open(MAPPING_FILE, "w").write(backup)
+    restart_cecd()
+    print("cecd rejected the new mappings; rolled back.\n" + err, file=sys.stderr)
+    return False
+
+
+def cmd_remap(args):
+    if args.list_buttons:
+        for code in sorted(UI_NAMES):
+            d = STOCK_MAPPINGS.get(code)
+            print(f"0x{code:02x}  {UI_NAMES[code]:30s} default: {key_label(d) if d is not None else '-'}")
+        return 0
+    if args.list_keys:
+        for n, c in sorted(KEY_CODES.items(), key=lambda x: x[1]):
+            print(f"{c:4d}  {n}")
+        print("Any other Linux keycode can be given as a number.")
+        return 0
+    clash = foreign_mapping_files()
+    if clash:
+        print(f"Warning: other cecd config files also set [mappings]: {', '.join(clash)}. "
+              "Files are applied in name order, so remove them to avoid surprises.", file=sys.stderr)
+    if args.reset:
+        if not os.path.exists(MAPPING_FILE):
+            print("No cec-assist mappings installed; cecd uses its defaults.")
+            return 0
+        ok = apply_with_rollback(lambda: os.remove(MAPPING_FILE))
+        print("Removed cec-assist mappings; cecd is back to its defaults." if ok else "Reset failed.")
+        return 0 if ok else 1
+    current = read_overrides()
+    if not args.overrides:
+        if not current:
+            print("No overrides (cecd defaults). Example: cec-assist remap select=KEY_PLAYPAUSE")
+        for code, val in sorted(current.items()):
+            print(f"{UI_NAMES[code]:20s} -> {key_label(val)}  (default {key_label(STOCK_MAPPINGS.get(code, 0))})")
+        return 0
+    try:
+        new = dict(current)
+        for spec in args.overrides:
+            code, val = parse_override(spec)
+            if STOCK_MAPPINGS.get(code) == val:
+                new.pop(code, None)  # mapping back to the default = drop the override
+            else:
+                new[code] = val
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
+    if not new:
+        return cmd_remap(argparse.Namespace(**{**vars(args), "reset": True, "overrides": []}))
+    ok = apply_with_rollback(lambda: write_mapping_file(new))
+    if ok:
+        print("Mappings applied:")
+        for code, val in sorted(new.items()):
+            print(f"  {UI_NAMES[code]:20s} -> {key_label(val)}")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+def cmd_status(_args):
+    obj = device_obj()
+    up = cecd_active()
+    print(f"cecd:            {'running' if up else 'NOT running'}")
+    if up:
+        print(f"CEC device:      {obj}")
+        print(f"physical addr:   {fmt_pa(own_phys_addr(obj))}")
+        la = (get_prop(obj, DEV_IFACE, "LogicalAddresses") or "").split()[2:]  # "ay N a b..."
+        print("logical addrs:   " + (", ".join(f"{a} ({LOGICAL_NAMES[int(a) & 15]})" for a in la) or "none"))
+        upd = (get_prop(DAEMON_OBJ, CFG_IFACE, "Uinput") or "? ?").split()[-1]
+        print(f"remote->keys:    {'enabled' if upd == 'true' else 'DISABLED (uinput off)' if upd == 'false' else '?'}")
+    d = run(["systemctl", "--user", "is-active", "cec-assist"]).stdout.strip()
+    print(f"cec-assist:      {d}")
+    ov = read_overrides()
+    print("remaps:          " + (", ".join(f"{UI_NAMES[c]}->{key_label(v)}" for c, v in sorted(ov.items()))
+                                 if ov else "none from cec-assist"))
+    for f in foreign_mapping_files():
+        print(f"                 also: {os.path.join(CECD_CONFIG_DIR, f)} sets [mappings] (not managed by cec-assist)")
+    print(f"config:          {CONFIG_FILE if os.path.exists(CONFIG_FILE) else 'defaults'}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+def main():
+    ap = argparse.ArgumentParser(prog="cec-assist", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("daemon", help="run the background fixer (used by the systemd unit)")
+    sub.add_parser("claim", help="claim CEC active source now")
+    m = sub.add_parser("monitor", help="show CEC routing messages and remote presses")
+    m.add_argument("-s", "--seconds", type=int, default=0, help="stop after N seconds")
+    m.add_argument("-a", "--all", action="store_true", help="show every CEC message")
+    r = sub.add_parser("remap", help="remap remote buttons (keeps all other defaults)",
+                       description="e.g. cec-assist remap select=KEY_PLAYPAUSE left=KEY_PREVIOUSSONG")
+    r.add_argument("overrides", nargs="*", metavar="BUTTON=KEY")
+    r.add_argument("--reset", action="store_true", help="remove all overrides")
+    r.add_argument("--list-buttons", action="store_true", help="list remote button names")
+    r.add_argument("--list-keys", action="store_true", help="list known key names")
+    sub.add_parser("status", help="show current state")
+    args = ap.parse_args()
+    return {"daemon": cmd_daemon, "claim": cmd_claim, "monitor": cmd_monitor,
+            "remap": cmd_remap, "status": cmd_status}[args.cmd](args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
